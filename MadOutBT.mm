@@ -230,6 +230,7 @@ struct BtStats {
 };
 static BtStats gStats;
 
+static bool gHooked = false;
 static uintptr_t resolveBase();   // 前置声明（statusText 里要用）
 
 /* ============================== 状态 ============================== */
@@ -853,8 +854,6 @@ static UISwitch *mkSwitch(UIView *parent, NSString *title, BOOL on, SEL action, 
 @end
 
 /* ============================== 启动 ============================== */
-
-static bool gHooked = false;
 
 /* dylib 由主程序在启动早期加载，此时 UnityFramework 往往还没进内存。
    这里先 dlsym+dladdr，失败再主动 dlopen 一次；仍然失败就返回 0，由上层重试。 */
