@@ -38,7 +38,11 @@ static void *kPlayer, *kCamera, *kTransform, *kAnimator, *kScreen;
 static void *mCurPlayer, *mCamMain, *mW2S, *mGetPos, *mBone, *mScrW, *mScrH;
 static void *mAllCams, *mCamCurrent;
 static int (*f_arrlen)(void *);
+static void (*f_classinit)(void *);
+static size_t (*f_fieldoffset)(void *);
+static void *(*f_parent)(void *);
 static void *fControls;
+static int OFF_BODY = 0x194, OFF_LIVE = 0x208, OFF_ANIM = 0x370, OFF_CTRLS_LIST = 0x10;
 static bool gIl2 = false;
 
 static void bind_api(void) {
@@ -55,6 +59,9 @@ static void bind_api(void) {
     f_unbox    = (void *(*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_object_unbox");
     f_invoke   = (void *(*)(void *, void *, void **, void **))dlsym(RTLD_DEFAULT, "il2cpp_runtime_invoke");
     f_arrlen   = (int (*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_array_length");
+    f_classinit   = (void (*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_runtime_class_init");
+    f_fieldoffset = (size_t (*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_field_get_offset");
+    f_parent      = (void *(*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_class_get_parent");
 }
 
 static void *img_find(const char *n) {
@@ -125,6 +132,21 @@ static void *resolve_camera(void) {
     return NULL;
 }
 
+/* 沿继承链找字段偏移（PlayerControl 的 body_pos/_live/animator 大多在 Control 上） */
+static int off_of(void *klass, const char *name) {
+    void *k = klass;
+    int depth = 0;
+    while (k && depth++ < 12) {
+        void *f = f_fieldfrom(k, name);
+        if (f && f_fieldoffset) {
+            size_t off = f_fieldoffset(f);
+            if (off < 0x4000) return (int)off;
+        }
+        k = f_parent ? f_parent(k) : NULL;
+    }
+    return -1;
+}
+
 static void *bone_of(void *anim, int bone) {
     if (!mBone || !anim) return NULL;
     int b = bone; void *params[1] = { &b };
@@ -146,11 +168,21 @@ static bool il2_init(void) {
         kAnimator  = f_classfrom(unity, "UnityEngine", "Animator");
         kScreen    = f_classfrom(unity, "UnityEngine", "Screen");
     }
-    fControls  = f_fieldfrom(kPlayer, "controls");           /* 实际在 Control 上 */
-    if (!fControls) {
-        void *kCtl = f_classfrom(cs, "", "Control");
-        fControls = kCtl ? f_fieldfrom(kCtl, "controls") : NULL;
+    void *kCtl = f_classfrom(cs, "", "Control");
+    if (f_classinit) {                       /* 强制静态构造，controls 才会建好 */
+        if (kCtl) f_classinit(kCtl);
+        f_classinit(kPlayer);
     }
+    fControls = kCtl ? f_fieldfrom(kCtl, "controls") : NULL;
+    if (!fControls) fControls = f_fieldfrom(kPlayer, "controls");
+
+    int offA = off_of(kPlayer, "body_pos");
+    int offB = off_of(kPlayer, "_live");
+    int offC = off_of(kPlayer, "animator");
+    if (offA > 0) OFF_BODY = offA;
+    if (offB > 0) OFF_LIVE = offB;
+    if (offC > 0) OFF_ANIM = offC;
+    NSLog(@"[UM] offsets body=0x%x live=0x%x anim=0x%x", OFF_BODY, OFF_LIVE, OFF_ANIM);
     mCurPlayer = f_methfrom(kPlayer, "get_CurrentPlayer", 0);
     if (kCamera) {
         mCamMain = f_methfrom(kCamera, "get_main", 0);
@@ -219,19 +251,19 @@ static const int kPairs[18][2] = {
     int drawn = 0;
 
     CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
-    Vec3 origin; memcpy(&origin, (char *)lp + 0x194, 12);
+    Vec3 origin; memcpy(&origin, (char *)lp + OFF_BODY, 12);
 
     for (int i = 0; i < n; i++) {
         void *c = *(void **)((char *)items + 0x20 + i * 8);
         if (!c || c == lp) continue;
         if (!f_assign || !f_assign(kPlayer, f_objclass(c))) continue;
-        if (*(int *)((char *)c + 0x208) <= 0) continue;
+        if (*(int *)((char *)c + OFF_LIVE) <= 0) continue;
 
-        Vec3 body; memcpy(&body, (char *)c + 0x194, 12);
+        Vec3 body; memcpy(&body, (char *)c + OFF_BODY, 12);
         float d = v3dist(origin, body);
         if (d > gMaxDist || d < 1.0f) continue;
 
-        void *anim = *(void **)((char *)c + 0x370);
+        void *anim = *(void **)((char *)c + OFF_ANIM);
         Vec3 head = body, foot = body, tmp;
         head.y += 0.85f; foot.y -= 0.95f;
         void *trH = bone_of(anim, 10);
@@ -285,7 +317,7 @@ static const int kPairs[18][2] = {
         }
     }
     gDbgDrawn = drawn;
-    gDbgText = [NSString stringWithFormat:@"n=%d drawn=%d sw=%d sh=%d cam=%@", n, drawn, sw, sh, gCamSrc];
+    gDbgText = [NSString stringWithFormat:@"n=%d drawn=%d sw=%d sh=%d cam=%@ b=0x%x l=0x%x a=0x%x", n, drawn, sw, sh, gCamSrc, OFF_BODY, OFF_LIVE, OFF_ANIM];
 }
 @end
 
