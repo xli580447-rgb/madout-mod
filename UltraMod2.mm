@@ -36,7 +36,7 @@ static void *(*f_invoke)(void *, void *, void **, void **);
 
 static void *kPlayer, *kCamera, *kTransform, *kAnimator, *kScreen;
 static void *mCurPlayer, *mCamMain, *mW2S, *mGetPos, *mBone, *mScrW, *mScrH;
-static void *mAllCams, *mCamCurrent;
+static void *mAllCams, *mCamCurrent, *mViewM, *mProjM;
 static int (*f_arrlen)(void *);
 static void (*f_classinit)(void *);
 static size_t (*f_fieldoffset)(void *);
@@ -147,6 +147,35 @@ static int off_of(void *klass, const char *name) {
     return -1;
 }
 
+/* 从 il2cpp_runtime_invoke 拿 Matrix4x4（返回的是指向 64 字节结构的指针） */
+static bool get_mat4(void *mi, void *self, float m[16]) {
+    if (!mi || !f_invoke) return false;
+    void *r = f_invoke(mi, self, NULL, NULL);
+    if (!r) return false;
+    memcpy(m, r, 64);
+    for (int i = 0; i < 16; i++) if (!isfinite(m[i])) return false;
+    return true;
+}
+
+/* 逆向自 ESP_ProjectWorld：view 取 z/y/x 行，proj 求 w 与 ndc，越界剔除 */
+static bool project_manual(const float V[16], const float P[16], Vec3 w,
+                           int sw, int sh, Vec3 *out) {
+    float zv = V[2]*w.x + V[6]*w.y + V[10]*w.z + V[14];
+    if (!isfinite(zv) || zv > -0.01f) return false;       /* 在相机后面 */
+    float yv = V[1]*w.x + V[5]*w.y + V[9]*w.z + V[13];
+    float xv = V[0]*w.x + V[4]*w.y + V[8]*w.z + V[12];
+    float cw = P[3]*xv + P[7]*yv + P[11]*zv + P[15];
+    if (!isfinite(cw) || cw <= 0.001f) return false;
+    float nx = (P[0]*xv + P[4]*yv + P[8]*zv + P[12]) / cw;
+    float ny = (P[1]*xv + P[5]*yv + P[9]*zv + P[13]) / cw;
+    if (!isfinite(nx) || !isfinite(ny)) return false;
+    if (fabsf(nx) > 1.6f || fabsf(ny) > 1.6f) return false;
+    out->x = (nx * 0.5f + 0.5f) * sw;
+    out->y = (0.5f - ny * 0.5f) * sh;
+    out->z = -zv;
+    return true;
+}
+
 static void *bone_of(void *anim, int bone) {
     if (!mBone || !anim) return NULL;
     int b = bone; void *params[1] = { &b };
@@ -189,6 +218,8 @@ static bool il2_init(void) {
         mAllCams = f_methfrom(kCamera, "get_allCameras", 0);
         mCamCurrent = f_methfrom(kCamera, "get_current", 0);
         mW2S = f_methfrom(kCamera, "WorldToScreenPoint", 1);
+        mViewM = f_methfrom(kCamera, "get_worldToCameraMatrix", 0);
+        mProjM = f_methfrom(kCamera, "get_projectionMatrix", 0);
     }
     if (kTransform) mGetPos = f_methfrom(kTransform, "get_position", 0);
     if (kAnimator)  mBone   = f_methfrom(kAnimator, "GetBoneTransform", 1);
@@ -247,6 +278,9 @@ static const int kPairs[18][2] = {
 
     void *cam = resolve_camera();
     if (!cam) { gDbgText = @"no camera"; return; }
+
+    float V[16], P[16];
+    bool haveMat = get_mat4(mViewM, cam, V) && get_mat4(mProjM, cam, P);
     gDbgTotal = n;
     int drawn = 0;
 
@@ -272,9 +306,16 @@ static const int kPairs[18][2] = {
         if (trF && call_vec3(mGetPos, trF, NULL, &tmp)) { tmp.y -= 0.1f; foot = tmp; }
 
         Vec3 shr, sfo;
-        if (!call_vec3(mW2S, cam, &head, &shr)) continue;
-        if (!call_vec3(mW2S, cam, &foot, &sfo)) continue;
-        if (shr.z <= 0.1f || sfo.z <= 0.1f) continue;
+        bool ok = false;
+        if (haveMat) {
+            ok = project_manual(V, P, head, sw, sh, &shr) &&
+                 project_manual(V, P, foot, sw, sh, &sfo);
+        }
+        if (!ok) {
+            if (!call_vec3(mW2S, cam, &head, &shr)) continue;
+            if (!call_vec3(mW2S, cam, &foot, &sfo)) continue;
+            if (shr.z <= 0.1f || sfo.z <= 0.1f) continue;
+        }
 
         CGFloat hx = shr.x / sw * W, hy = (1.0f - shr.y / sh) * H;
         CGFloat fy = (1.0f - sfo.y / sh) * H;
@@ -308,8 +349,11 @@ static const int kPairs[18][2] = {
                 if (!ta || !tb) continue;
                 if (!call_vec3(mGetPos, ta, NULL, &a)) continue;
                 if (!call_vec3(mGetPos, tb, NULL, &b)) continue;
-                if (!call_vec3(mW2S, cam, &a, &sa)) continue;
-                if (!call_vec3(mW2S, cam, &b, &sb)) continue;
+                bool oka = haveMat ? project_manual(V, P, a, sw, sh, &sa)
+                                   : call_vec3(mW2S, cam, &a, &sa);
+                bool okb = haveMat ? project_manual(V, P, b, sw, sh, &sb)
+                                   : call_vec3(mW2S, cam, &b, &sb);
+                if (!oka || !okb) continue;
                 CGContextMoveToPoint(cx, sa.x / sw * W, (1.0f - sa.y / sh) * H);
                 CGContextAddLineToPoint(cx, sb.x / sw * W, (1.0f - sb.y / sh) * H);
                 CGContextStrokePath(cx);
@@ -317,7 +361,7 @@ static const int kPairs[18][2] = {
         }
     }
     gDbgDrawn = drawn;
-    gDbgText = [NSString stringWithFormat:@"n=%d drawn=%d sw=%d sh=%d cam=%@ b=0x%x l=0x%x a=0x%x", n, drawn, sw, sh, gCamSrc, OFF_BODY, OFF_LIVE, OFF_ANIM];
+    gDbgText = [NSString stringWithFormat:@"n=%d drawn=%d sw=%d sh=%d cam=%@ mat=%d", n, drawn, sw, sh, gCamSrc, (int)haveMat];
 }
 @end
 
