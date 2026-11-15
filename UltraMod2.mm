@@ -213,6 +213,9 @@ static bool il2_init(void) {
     if (offC > 0) OFF_ANIM = offC;
     NSLog(@"[UM] offsets body=0x%x live=0x%x anim=0x%x", OFF_BODY, OFF_LIVE, OFF_ANIM);
     mCurPlayer = f_methfrom(kPlayer, "get_CurrentPlayer", 0);
+    kCar = f_classfrom(cs, "", "CarControl");
+    if (kCar) mCarCur = f_methfrom(kCar, "get_CurrentCar", 0);
+    mAimSet = f_methfrom(kCtl ? kCtl : kPlayer, "SetCamDirByWorldPoint", 1);
     if (kCamera) {
         mCamMain = f_methfrom(kCamera, "get_main", 0);
         mAllCams = f_methfrom(kCamera, "get_allCameras", 0);
@@ -230,6 +233,11 @@ static bool il2_init(void) {
 
 /* ================= 配置 / 全局 ================= */
 static BOOL gBox = YES, gSkel = NO, gDist = YES;
+static BOOL gCarBox = NO, gAntenna = NO, gFovCircle = NO, gAimOn = NO, gBotOnly = NO;
+static float gFovRadius = 120.0f;      /* 准心 FOV 半径（像素） */
+static void *kCar = NULL, *mCarCur = NULL;
+static void *mAimSet = NULL;           /* Control::SetCamDirByWorldPoint */
+static Vec3 gAimTarget; static BOOL gAimHas = NO;
 static int gDbgTotal = 0, gDbgDrawn = 0;
 static NSString *gDbgText = @"-";
 static float gMaxDist = 300.0f;
@@ -338,6 +346,17 @@ static const int kPairs[18][2] = {
                 withAttributes:@{NSFontAttributeName: [UIFont boldSystemFontOfSize:10],
                                  NSForegroundColorAttributeName: [UIColor yellowColor]}];
             }
+            if (gAntenna) {
+                CGContextSetLineWidth(cx, 1.0);
+                CGContextSetRGBStrokeColor(cx, 0.4, 0.9, 1.0, 0.95);
+                CGContextMoveToPoint(cx, hx, hy);
+                CGContextAddLineToPoint(cx, hx, hy - 40);
+                CGContextStrokePath(cx);
+                CGContextMoveToPoint(cx, W * 0.5f, 0);
+                CGContextAddLineToPoint(cx, hx, hy - 40);
+                CGContextStrokePath(cx);
+            }
+            }
         }
         if (gSkel && anim) {
             CGContextSetLineWidth(cx, 1.2);
@@ -360,6 +379,44 @@ static const int kPairs[18][2] = {
             }
         }
     }
+
+    /* ---- FOV 圈 ---- */
+    if (gFovCircle) {
+        CGContextSetLineWidth(cx, 1.2);
+        CGContextSetRGBStrokeColor(cx, 1, 1, 1, 0.75);
+        CGContextStrokeEllipseInRect(cx, CGRectMake(W/2 - gFovRadius, H/2 - gFovRadius,
+                                                    gFovRadius*2, gFovRadius*2));
+    }
+
+    /* ---- 车辆方框 ---- */
+    if (gCarBox && kCar && f_assign) {
+        for (int i = 0; i < n; i++) {
+            void *c = *(void **)((char *)items + 0x20 + i * 8);
+            if (!c) continue;
+            void *oc = f_objclass(c);
+            if (f_assign(kPlayer, oc)) continue;          /* 是玩家，跳过 */
+            if (!f_assign(kCar, oc)) continue;
+            Vec3 body; memcpy(&body, (char *)c + OFF_BODY, 12);
+            float d = v3dist(origin, body);
+            if (d > gMaxDist || d < 1.0f) continue;
+            Vec3 top = body, bot = body;
+            top.y += 0.9f; bot.y -= 0.6f;
+            Vec3 st, sb;
+            bool ok1 = haveMat ? project_manual(V, P, top, sw, sh, &st)
+                               : call_vec3(mW2S, cam, &top, &st);
+            bool ok2 = haveMat ? project_manual(V, P, bot, sw, sh, &sb)
+                               : call_vec3(mW2S, cam, &bot, &sb);
+            if (!ok1 || !ok2) continue;
+            CGFloat x1 = st.x/sw*W, y1 = (1.0f - st.y/sh)*H;
+            CGFloat y2 = (1.0f - sb.y/sh)*H;
+            CGFloat hh = fabs(y2-y1), ww = hh*0.7f;
+            if (hh < 6 || hh > H*1.6f) continue;
+            CGContextSetLineWidth(cx, 1.4);
+            CGContextSetRGBStrokeColor(cx, 1.0, 0.62, 0.15, 1.0);
+            CGContextStrokeRect(cx, CGRectMake(x1-ww/2, y1, ww, hh));
+        }
+    }
+
     gDbgDrawn = drawn;
     gDbgText = [NSString stringWithFormat:@"n=%d drawn=%d sw=%d sh=%d cam=%@ mat=%d", n, drawn, sw, sh, gCamSrc, (int)haveMat];
 }
@@ -443,40 +500,141 @@ static const int kPairs[18][2] = {
         [x addTarget:self action:@selector(closeTap) forControlEvents:UIControlEventTouchUpInside];
         [self addSubview:x];
 
-        UMRow *r1 = [[UMRow alloc] initWithTitle:@"人物方框" y:44];
-        r1.on = gBox; r1.handler = ^(BOOL on) { gBox = on; [gEsp setNeedsDisplay]; };
-        [self addSubview:r1];
+        /* 页签 */
+        UISegmentedControl *tabs = [[UISegmentedControl alloc] initWithItems:@[@"人物", @"车辆", @"瞄准", @"其它"]];
+        tabs.frame = CGRectMake(12, 38, f.size.width - 24, 26);
+        tabs.selectedSegmentIndex = 0;
+        [tabs addTarget:self action:@selector(tabChanged:) forControlEvents:UIControlEventValueChanged];
+        tabs.tag = 910;
+        [self addSubview:tabs];
 
-        UMRow *r2 = [[UMRow alloc] initWithTitle:@"骨骼" y:84];
-        r2.on = gSkel; r2.handler = ^(BOOL on) { gSkel = on; [gEsp setNeedsDisplay]; };
-        [self addSubview:r2];
+        /* 人物页 */
+        UIView *pg0 = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 250, 170)];
+        UMRow *a1 = [[UMRow alloc] initWithTitle:@"人物方框" y:0];
+        a1.on = gBox; a1.handler = ^(BOOL v){ gBox = v; [gEsp setNeedsDisplay]; }; [pg0 addSubview:a1];
+        UMRow *a2 = [[UMRow alloc] initWithTitle:@"骨骼" y:36];
+        a2.on = gSkel; a2.handler = ^(BOOL v){ gSkel = v; [gEsp setNeedsDisplay]; }; [pg0 addSubview:a2];
+        UMRow *a3 = [[UMRow alloc] initWithTitle:@"天线" y:72];
+        a3.on = gAntenna; a3.handler = ^(BOOL v){ gAntenna = v; [gEsp setNeedsDisplay]; }; [pg0 addSubview:a3];
+        UMRow *a4 = [[UMRow alloc] initWithTitle:@"距离显示" y:108];
+        a4.on = gDist; a4.handler = ^(BOOL v){ gDist = v; [gEsp setNeedsDisplay]; }; [pg0 addSubview:a4];
 
-        UMRow *r3 = [[UMRow alloc] initWithTitle:@"距离显示" y:124];
-        r3.on = gDist; r3.handler = ^(BOOL on) { gDist = on; [gEsp setNeedsDisplay]; };
-        [self addSubview:r3];
+        /* 车辆页 */
+        UIView *pg1 = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 250, 120)];
+        UMRow *b1 = [[UMRow alloc] initWithTitle:@"车辆方框" y:0];
+        b1.on = gCarBox; b1.handler = ^(BOOL v){ gCarBox = v; [gEsp setNeedsDisplay]; }; [pg1 addSubview:b1];
 
-        UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(14, 168, 244, 44)];
-        st.numberOfLines = 0;
-        st.font = [UIFont systemFontOfSize:9.5];
-        st.textColor = [UIColor colorWithWhite:1 alpha:0.65];
-        st.text = gIl2 ? @"il2cpp 就绪" : @"il2cpp 未就绪";
-        st.tag = 902;
-        [self addSubview:st];
+        /* 瞄准页 */
+        UIView *pg2 = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 250, 170)];
+        UMRow *c1 = [[UMRow alloc] initWithTitle:@"自瞄（追踪）" y:0];
+        c1.on = gAimOn; c1.handler = ^(BOOL v){ gAimOn = v; }; [pg2 addSubview:c1];
+        UMRow *c2 = [[UMRow alloc] initWithTitle:@"FOV 圈" y:36];
+        c2.on = gFovCircle; c2.handler = ^(BOOL v){ gFovCircle = v; [gEsp setNeedsDisplay]; }; [pg2 addSubview:c2];
+        UISlider *fov = [[UISlider alloc] initWithFrame:CGRectMake(0, 78, 250, 30)];
+        fov.minimumValue = 40; fov.maximumValue = 300; fov.value = gFovRadius;
+        fov.continuous = YES;
+        [fov addTarget:self action:@selector(fovChanged:) forControlEvents:UIControlEventValueChanged];
+        [pg2 addSubview:fov];
 
-        /* 每秒刷新调试信息 */
-        [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
-            st.text = [NSString stringWithFormat:@"il2:%d  %@", (int)gIl2, gDbgText];
-        }];
+        /* 其它页 */
+        UIView *pg3 = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 250, 120)];
+        UMRow *d1 = [[UMRow alloc] initWithTitle:@"防录屏" y:0];
+        d1.handler = ^(BOOL v){ [self antiCapture:v]; }; [pg3 addSubview:d1];
+
+        _pages = @[pg0, pg1, pg2, pg3];
+        CGRect fb = self.bounds;
+        _scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(14, 70, fb.size.width - 28, fb.size.height - 84)];
+        _scroll.showsVerticalScrollIndicator = NO;
+        [self addSubview:_scroll];
+        for (UIView *pg in _pages) { pg.hidden = (pg != pg0); [_scroll addSubview:pg]; }
+        _scroll.contentSize = CGSizeMake(fb.size.width - 28, 180);
 
         [self addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
     }
     return self;
 }
 - (void)closeTap { if (self.onClose) self.onClose(); }
+
+- (void)tabChanged:(UISegmentedControl *)s {
+    for (NSInteger i = 0; i < (NSInteger)_pages.count; i++) _pages[i].hidden = (i != s.selectedSegmentIndex);
+}
+- (void)fovChanged:(UISlider *)sl {
+    gFovRadius = sl.value;
+    [gEsp setNeedsDisplay];
+}
+- (void)antiCapture:(BOOL)on {
+    UIWindow *w = self.window;
+    if (!w) return;
+    static UITextField *secure = nil;
+    if (on && !secure) {
+        secure = [[UITextField alloc] initWithFrame:CGRectZero];
+        secure.secureTextEntry = YES;
+        [w addSubview:secure];
+    } else if (!on && secure) {
+        [secure removeFromSuperview];
+        secure = nil;
+    }
+}
 @end
 
 /* ================= 挂载 ================= */
 static void toggle_panel(void);
+
+/* ---- 自瞄：调用游戏自己的 SetCamDirByWorldPoint，不改任何指令 ---- */
+static void aim_tick(void) {
+    if (!gAimOn || !gIl2 || !mAimSet) return;
+    void *lp = call0(mCurPlayer, NULL);
+    if (!lp) return;
+    void *list = NULL;
+    f_fstatic(fControls, &list);
+    if (!list) return;
+    void *items = *(void **)((char *)list + 0x10);
+    int n = *(int *)((char *)list + 0x18);
+    if (!items || n <= 0 || n > 4096) return;
+
+    int sw = call_int(mScrW, NULL), sh = call_int(mScrH, NULL);
+    if (sw <= 0 || sh <= 0) return;
+    void *cam = resolve_camera();
+    if (!cam) return;
+    float V[16], P[16];
+    bool haveMat = get_mat4(mViewM, cam, V) && get_mat4(mProjM, cam, P);
+
+    Vec3 origin; memcpy(&origin, (char *)lp + OFF_BODY, 12);
+    float best = gFovRadius;           /* 像素半径 */
+    Vec3 bestPos; bool found = false;
+
+    for (int i = 0; i < n; i++) {
+        void *c = *(void **)((char *)items + 0x20 + i * 8);
+        if (!c || c == lp) continue;
+        if (!f_assign(kPlayer, f_objclass(c))) continue;
+        if (*(int *)((char *)c + OFF_LIVE) <= 0) continue;
+        Vec3 body; memcpy(&body, (char *)c + OFF_BODY, 12);
+        if (v3dist(origin, body) > gMaxDist) continue;
+
+        void *anim = *(void **)((char *)c + OFF_ANIM);
+        Vec3 head = body; head.y += 0.85f; Vec3 tmp;
+        void *trH = bone_of(anim, 10);
+        if (trH && call_vec3(mGetPos, trH, NULL, &tmp)) head = tmp;
+
+        Vec3 sp;
+        bool ok = haveMat ? project_manual(V, P, head, sw, sh, &sp)
+                          : call_vec3(mW2S, cam, &head, &sp);
+        if (!ok) continue;
+        float px = sp.x / sw * [UIScreen mainScreen].bounds.size.width;
+        float py = sp.y / sh * [UIScreen mainScreen].bounds.size.height;
+        float d = hypotf(px - [UIScreen mainScreen].bounds.size.width * 0.5f,
+                         py - [UIScreen mainScreen].bounds.size.height * 0.5f);
+        if (d < best) { best = d; bestPos = head; found = true; }
+    }
+
+    gAimHas = found;
+    if (found) {
+        gAimTarget = bestPos;
+        Vec3 arg = bestPos;
+        void *params[1] = { &arg };
+        f_invoke(mAimSet, lp, params, NULL);
+    }
+}
 
 @interface UMBadge : UILabel
 @end
@@ -550,6 +708,8 @@ static void attach_all(void) {
                 gDiag.hidden = YES;
             }
         });
+
+        [NSTimer scheduledTimerWithTimeInterval:0.05 repeats:YES block:^(NSTimer *t) { aim_tick(); }];
 
         CADisplayLink *link = [CADisplayLink displayLinkWithTarget:gEsp selector:@selector(tick:)];
         link.preferredFramesPerSecond = 15;
