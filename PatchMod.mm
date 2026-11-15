@@ -262,25 +262,40 @@ static void refresh_status(void) {
 
 /* 不再自建 UIWindow —— 直接把面板塞进游戏自己的窗口里，
    这样不会抢 key、不会挡触摸、也不会和 Scene 打架 */
+static int gWinCount = 0;
+static NSString *gHostDesc = @"?";
+
 static UIView *pm_host_view(void) {
-    UIWindow *best = nil;
+    UIWindow *bestWin = nil;
+    CGFloat bestArea = 0;
+    gWinCount = 0;
     for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
         if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-        UIWindowScene *ws = (UIWindowScene *)sc;
-        for (UIWindow *w in ws.windows) {
-            if (w.windowLevel == UIWindowLevelNormal && !w.hidden) { best = w; break; }
-        }
-        if (best) break;
-    }
-    if (!best) best = UIApplication.sharedApplication.keyWindow;
-    if (!best) {
-        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-            UIWindowScene *ws = (UIWindowScene *)sc;
-            if (ws.windows.count) { best = ws.windows.firstObject; break; }
+        for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+            gWinCount++;
+            if (w.hidden) continue;
+            CGFloat a = w.bounds.size.width * w.bounds.size.height;
+            if (w.windowLevel == UIWindowLevelNormal && a > bestArea) { bestWin = w; bestArea = a; }
         }
     }
-    return best.rootViewController.view ?: best;
+    if (!bestWin) bestWin = UIApplication.sharedApplication.keyWindow;
+    if (!bestWin) bestWin = UIApplication.sharedApplication.windows.firstObject;
+    if (!bestWin) { gHostDesc = @"no window"; return nil; }
+
+    /* 在 window 的整棵子树里找面积最大的 view —— Unity 的渲染视图不一定挂在 rootVC.view 上 */
+    UIView *host = bestWin;
+    CGFloat area = 0;
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:bestWin];
+    while (stack.count) {
+        UIView *v = stack.lastObject; [stack removeLastObject];
+        CGFloat a = v.bounds.size.width * v.bounds.size.height;
+        if (a > area) { area = a; host = v; }
+        for (UIView *sv in v.subviews) [stack addObject:sv];
+    }
+    gHostDesc = [NSString stringWithFormat:@"%@ %.0fx%.0f sub=%lu",
+                 NSStringFromClass([host class]), host.bounds.size.width, host.bounds.size.height,
+                 (unsigned long)host.subviews.count];
+    return host;
 }
 
 static UIView *gHostView = nil;
@@ -293,7 +308,7 @@ static void pm_attach_badge(void) {
         UIView *host = gHostView;
         if (!host) return;
         gBadge = [[UILabel alloc] initWithFrame:CGRectMake(12, 60, 240, 18)];
-        gBadge.text = @"PatchMod loaded";
+        gBadge.text = [NSString stringWithFormat:@"PM ok W:%d %@", gWinCount, gHostDesc];
         gBadge.textColor = [UIColor colorWithRed:0.4 green:1 blue:0.6 alpha:1];
         gBadge.font = [UIFont boldSystemFontOfSize:12];
         gBadge.userInteractionEnabled = NO;
