@@ -231,6 +231,7 @@ struct BtStats {
 static BtStats gStats;
 
 static bool gHooked = false;
+static bool initIl2cpp();
 static uintptr_t resolveBase();   // 前置声明（statusText 里要用）
 
 /* ============================== 状态 ============================== */
