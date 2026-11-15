@@ -57,6 +57,42 @@ static bool bt_insn_is_pcrel(uint32_t insn) {
     return false;
 }
 
+
+/* 指针合法性：iOS 用户态地址都在 0x100000000 以上 */
+static inline bool bt_ptr_ok(const void *p) {
+    uintptr_t v = (uintptr_t)p;
+    return v > 0x100000000ULL && v < 0x8000000000ULL;
+}
+
+/* 每个钩子目标的预期前 4 条指令（从 21.30 的 UnityFramework 实测），
+   不匹配就不挂钩子，避免打错函数把游戏搞崩 */
+struct BtExpect { uint32_t w[4]; };
+static const BtExpect kExpDoShot      = {{0x6DB63BEFu,0x6D0133EDu,0x6D022BEBu,0x6D0323E9u}};
+static const BtExpect kExpShotsAdd    = {{0xD10283FFu,0x6D0233EDu,0x6D032BEBu,0x6D0423E9u}};
+static const BtExpect kExpItemUpdate  = {{0x6DB73BEFu,0x6D0133EDu,0x6D022BEBu,0x6D0323E9u}};
+static const BtExpect kExpBoneShot    = {{0xD102C3FFu,0x6D023BEFu,0x6D0333EDu,0x6D042BEBu}};
+static const BtExpect kExpMinusOne    = {{0xD10103FFu,0xA9024FF4u,0xA9037BFDu,0x9100C3FDu}};
+static const BtExpect kExpGetCount    = {{0xD10103FFu,0xA9024FF4u,0xA9037BFDu,0x9100C3FDu}};
+static const BtExpect kExpCmdReliable = {{0xD10403FFu,0xA90C5FF8u,0xA90D57F6u,0xA90E4FF4u}};
+static const BtExpect kExpCmdUnrel    = {{0xD10403FFu,0xA90C5FF8u,0xA90D57F6u,0xA90E4FF4u}};
+
+static bool bt_hook_checked(void *target, void *replacement, void **origin, const BtExpect *exp, const char *name) {
+    if (!bt_ptr_ok(target) || !exp) { NSLog(@"[BT] %s 地址非法", name); return false; }
+    const uint32_t *w = (const uint32_t *)target;
+    for (int i = 0; i < 4; i++) {
+        if (w[i] != exp->w[i]) {
+            NSLog(@"[BT] %s 序言不匹配 (第%d条 0x%08x != 0x%08x)，跳过",
+                  name, i, w[i], exp->w[i]);
+            return false;
+        }
+    }
+    void *tramp = bt_hook(target, replacement);
+    if (!tramp) { NSLog(@"[BT] %s 挂钩失败", name); return false; }
+    if (origin) *origin = tramp;
+    NSLog(@"[BT] %s 挂钩成功", name);
+    return true;
+}
+
 /* 返回 trampoline（调用它 = 执行原函数），失败返回 NULL */
 static void *bt_hook(void *target, void *replacement) {
     if (!target || !replacement) return NULL;
@@ -349,6 +385,7 @@ typedef void (*DoShot_t)(void *);
 static DoShot_t orig_DoShot = nullptr;
 
 static void hook_DoShot(void *self) {
+    if (!bt_ptr_ok(self)) { if (orig_DoShot) orig_DoShot(self); return; }
     gStats.doShot++;
     if (!self) { orig_DoShot(self); return; }
     void *player = *(void **)((char *)self + OFS_WEAPON_PLAYER);
@@ -475,6 +512,7 @@ typedef bool (*BoneProcessShot_t)(void *, Ray *, void *);
 static BoneProcessShot_t orig_BoneProcessShot = nullptr;
 
 static bool hook_BoneProcessShot(void *self, Ray *ray, void *shot) {
+    if (!bt_ptr_ok(self) || !orig_BoneProcessShot) return false;
     gStats.bone++;
     if (!gCfg.hitbox || !gCurrentItemMine || !self) {
         return orig_BoneProcessShot(self, ray, shot);
@@ -495,12 +533,14 @@ static MinusOne_t orig_MinusOne = nullptr;
 static GetCount_t orig_GetCount = nullptr;
 
 static void hook_MinusOne(void *self) {
+    if (!bt_ptr_ok(self)) { if (orig_MinusOne) orig_MinusOne(self); return; }
     gStats.minusOne++;
     if (gCfg.extMag) return;      // 不扣弹
     orig_MinusOne(self);
 }
 
 static int hook_GetCount(void *self) {
+    if (!bt_ptr_ok(self) || !orig_GetCount) return 0;
     gStats.getCount++;
     int c = orig_GetCount(self);
     if (gCfg.extMag && c < gCfg.magSize) return gCfg.magSize;
@@ -899,15 +939,26 @@ static bool installHooks() {
     if (gHooked) return true;
     if (!resolveBase()) return false;
 
-    MSHookFunction((void *)(gBase + RVA_DoShot), (void *)hook_DoShot, (void **)&orig_DoShot);
-    MSHookFunction((void *)(gBase + RVA_Shots_Add), (void *)hook_ShotsAdd, (void **)&orig_ShotsAdd);
-    MSHookFunction((void *)(gBase + RVA_Item_Update), (void *)hook_ItemUpdate, (void **)&orig_ItemUpdate);
-    MSHookFunction((void *)(gBase + RVA_Bone_ProcessShot), (void *)hook_BoneProcessShot, (void **)&orig_BoneProcessShot);
-    MSHookFunction((void *)(gBase + RVA_Bullets_MinusOne), (void *)hook_MinusOne, (void **)&orig_MinusOne);
-    MSHookFunction((void *)(gBase + RVA_Bullets_GetCount), (void *)hook_GetCount, (void **)&orig_GetCount);
-    MSHookFunction((void *)(gBase + RVA_CmdShot_Reliable), (void *)hook_CmdShotReliable, (void **)&orig_CmdShotReliable);
-    MSHookFunction((void *)(gBase + RVA_CmdShot_Unrel), (void *)hook_CmdShotUnrel, (void **)&orig_CmdShotUnrel);
+    int ok = 0;
+    if (bt_hook_checked((void *)(gBase + RVA_DoShot), (void *)hook_DoShot,
+                        (void **)&orig_DoShot, &kExpDoShot, "DoShot")) ok++;
+    if (bt_hook_checked((void *)(gBase + RVA_Shots_Add), (void *)hook_ShotsAdd,
+                        (void **)&orig_ShotsAdd, &kExpShotsAdd, "Shots.Add")) ok++;
+    if (bt_hook_checked((void *)(gBase + RVA_Item_Update), (void *)hook_ItemUpdate,
+                        (void **)&orig_ItemUpdate, &kExpItemUpdate, "Item.Update")) ok++;
+    if (bt_hook_checked((void *)(gBase + RVA_Bone_ProcessShot), (void *)hook_BoneProcessShot,
+                        (void **)&orig_BoneProcessShot, &kExpBoneShot, "Bone.ProcessShot")) ok++;
+    if (bt_hook_checked((void *)(gBase + RVA_Bullets_MinusOne), (void *)hook_MinusOne,
+                        (void **)&orig_MinusOne, &kExpMinusOne, "Bullets.MinusOne")) ok++;
+    if (bt_hook_checked((void *)(gBase + RVA_Bullets_GetCount), (void *)hook_GetCount,
+                        (void **)&orig_GetCount, &kExpGetCount, "Bullets.GetCount")) ok++;
+    if (bt_hook_checked((void *)(gBase + RVA_CmdShot_Reliable), (void *)hook_CmdShotReliable,
+                        (void **)&orig_CmdShotReliable, &kExpCmdReliable, "CmdShot.Reliable")) ok++;
+    if (bt_hook_checked((void *)(gBase + RVA_CmdShot_Unrel), (void *)hook_CmdShotUnrel,
+                        (void **)&orig_CmdShotUnrel, &kExpCmdUnrel, "CmdShot.Unrel")) ok++;
 
+    NSLog(@"[BT] 钩子成功 %d/8", ok);
+    if (ok == 0) return false;      /* 一个都没成 → 让上层继续重试 */
     gHooked = true;
     return true;
 }
