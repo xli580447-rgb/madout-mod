@@ -1,0 +1,9 @@
+name: probe2
+on: { workflow_dispatch: {} }
+jobs:
+  win:
+    runs-on: windows-latest
+    steps: [{ run: echo win-ok }]
+  mac13:
+    runs-on: macos-13
+    steps: [{ run: sw_vers }]
