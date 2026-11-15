@@ -241,6 +241,25 @@ static void refresh_status(void) {
 
 @end
 
+/* 只有面板区域接收触摸，其余位置全部透传给游戏 */
+@interface PMWindow : UIWindow
+@property (nonatomic, weak) UIView *panelView;
+@end
+
+@implementation PMWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *v = [super hitTest:point withEvent:event];
+    if (v == self || v == self.rootViewController.view) return nil;
+    if (self.panelView) {
+        CGPoint p = [self convertPoint:point toView:self.panelView];
+        if (![self.panelView pointInside:p withEvent:event]) return nil;
+    } else {
+        return nil;   /* 面板还没出来 → 整窗不拦触摸 */
+    }
+    return v;
+}
+@end
+
 static UIWindow *gWindow = nil;
 static UILabel *gBadge = nil;
 
@@ -263,10 +282,10 @@ static UIWindow *pm_make_window(void) {
     UIWindow *w = nil;
     UIWindowScene *ws = pm_active_scene();
     if (ws) {
-        w = [[UIWindow alloc] initWithWindowScene:ws];
+        w = [[PMWindow alloc] initWithWindowScene:ws];
         w.frame = ws.coordinateSpace.bounds;
     } else {
-        w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+        w = [[PMWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     }
     w.windowLevel = UIWindowLevelAlert + 500;
     w.backgroundColor = [UIColor clearColor];
@@ -299,6 +318,7 @@ static void pm_show_menu(void) {
         PMPanel *panel = [[PMPanel alloc] initWithFrame:CGRectMake(20, 120, 268, 240)];
         [panel addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:panel action:@selector(pan:)]];
         [gWindow.rootViewController.view addSubview:panel];
+        if ([gWindow isKindOfClass:[PMWindow class]]) ((PMWindow *)gWindow).panelView = panel;
         [gWindow setHidden:NO];
         NSLog(@"[PM] 面板已挂到窗口 %@", gWindow);
     });
