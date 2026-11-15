@@ -58,6 +58,8 @@ static bool bt_insn_is_pcrel(uint32_t insn) {
 }
 
 
+static void *bt_hook(void *target, void *replacement);
+
 /* 指针合法性：iOS 用户态地址都在 0x100000000 以上 */
 static inline bool bt_ptr_ok(const void *p) {
     uintptr_t v = (uintptr_t)p;
