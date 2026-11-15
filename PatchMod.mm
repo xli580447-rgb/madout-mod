@@ -260,78 +260,70 @@ static void refresh_status(void) {
 }
 @end
 
-static UIWindow *gWindow = nil;
-static UILabel *gBadge = nil;
-
-/* iOS 13+ 必须挂到 UIWindowScene 上，否则窗口不会显示 */
-static UIWindowScene *pm_active_scene(void) {
-    if (@available(iOS 13.0, *)) {
+/* 不再自建 UIWindow —— 直接把面板塞进游戏自己的窗口里，
+   这样不会抢 key、不会挡触摸、也不会和 Scene 打架 */
+static UIView *pm_host_view(void) {
+    UIWindow *best = nil;
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)sc;
+        for (UIWindow *w in ws.windows) {
+            if (w.windowLevel == UIWindowLevelNormal && !w.hidden) { best = w; break; }
+        }
+        if (best) break;
+    }
+    if (!best) best = UIApplication.sharedApplication.keyWindow;
+    if (!best) {
         for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
             if (![sc isKindOfClass:[UIWindowScene class]]) continue;
             UIWindowScene *ws = (UIWindowScene *)sc;
-            if (ws.activationState == UISceneActivationStateForegroundActive) return ws;
-        }
-        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-            if ([sc isKindOfClass:[UIWindowScene class]]) return (UIWindowScene *)sc;
+            if (ws.windows.count) { best = ws.windows.firstObject; break; }
         }
     }
-    return nil;
+    return best.rootViewController.view ?: best;
 }
 
-static UIWindow *pm_make_window(void) {
-    UIWindow *w = nil;
-    UIWindowScene *ws = pm_active_scene();
-    if (ws) {
-        w = [[PMWindow alloc] initWithWindowScene:ws];
-        w.frame = ws.coordinateSpace.bounds;
-    } else {
-        w = [[PMWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
-    }
-    w.windowLevel = UIWindowLevelAlert + 500;
-    w.backgroundColor = [UIColor clearColor];
-    UIViewController *vc = [UIViewController new];
-    vc.view.backgroundColor = [UIColor clearColor];
-    w.rootViewController = vc;
-    return w;
-}
+static UIView *gHostView = nil;
+static UILabel *gBadge = nil;
+static PMPanel *gPanel = nil;
 
-static void pm_show_badge(void) {
-    if (gBadge) return;
-    UIWindow *w = gWindow;
-    if (!w) return;
-    gBadge = [[UILabel alloc] initWithFrame:CGRectMake(12, 60, 220, 18)];
-    gBadge.text = @"PatchMod loaded";
-    gBadge.textColor = [UIColor colorWithRed:0.4 green:1 blue:0.6 alpha:1];
-    gBadge.font = [UIFont boldSystemFontOfSize:12];
-    [w.rootViewController.view addSubview:gBadge];
-}
-
-static void pm_show_menu(void) {
+static void pm_attach_badge(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!gWindow) {
-            gWindow = pm_make_window();
-            [gWindow setHidden:NO];
-        }
-        if (!gWindow.hidden && gWindow.rootViewController.view.subviews.count > 0) return;
+        if (gBadge) return;
+        UIView *host = gHostView;
+        if (!host) return;
+        gBadge = [[UILabel alloc] initWithFrame:CGRectMake(12, 60, 240, 18)];
+        gBadge.text = @"PatchMod loaded";
+        gBadge.textColor = [UIColor colorWithRed:0.4 green:1 blue:0.6 alpha:1];
+        gBadge.font = [UIFont boldSystemFontOfSize:12];
+        gBadge.userInteractionEnabled = NO;
+        [host addSubview:gBadge];
+        NSLog(@"[PM] badge 挂到 %@", host);
+    });
+}
 
-        CGRect b = gWindow.bounds;
-        PMPanel *panel = [[PMPanel alloc] initWithFrame:CGRectMake(20, 120, 268, 240)];
-        [panel addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:panel action:@selector(pan:)]];
-        [gWindow.rootViewController.view addSubview:panel];
-        if ([gWindow isKindOfClass:[PMWindow class]]) ((PMWindow *)gWindow).panelView = panel;
-        [gWindow setHidden:NO];
-        NSLog(@"[PM] 面板已挂到窗口 %@", gWindow);
+static void pm_attach_panel(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gPanel) return;
+        UIView *host = gHostView;
+        if (!host) return;
+        CGRect f = host.bounds;
+        CGFloat x = (f.size.width - 268) / 2;
+        gPanel = [[PMPanel alloc] initWithFrame:CGRectMake(x, 120, 268, 240)];
+        [gPanel addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:gPanel action:@selector(pan:)]];
+        [host addSubview:gPanel];
+        NSLog(@"[PM] 面板挂到 %@", host);
     });
 }
 
 __attribute__((constructor)) static void pm_entry(void) {
     /* 前 20 秒完全不动作，避免拖慢 Unity 启动被看门狗杀 */
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        sleep(3);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (!gWindow) { gWindow = pm_make_window(); [gWindow setHidden:NO]; }
-            pm_show_badge();
-        });
+        for (int i = 0; i < 40 && !gHostView; i++) {
+            dispatch_sync(dispatch_get_main_queue(), ^{ if (!gHostView) gHostView = pm_host_view(); });
+            if (!gHostView) sleep(1);
+        }
+        pm_attach_badge();
         sleep(17);
         for (int i = 0; i < 30 && !gBase; i++) { resolve_base(); if (!gBase) sleep(1); }
         bool a = slot_init(&gMag, "MinusOne", RVA_MINUS_ONE, EXP_MINUS_ONE, INSN_RET, 0, 1);
@@ -340,6 +332,6 @@ __attribute__((constructor)) static void pm_entry(void) {
         gReady = true;
         NSLog(@"[PM] 就绪 base=%p 槽位 %d%d%d", (void *)gBase, a, b, c);
         refresh_status();
-        pm_show_menu();
+        pm_attach_panel();
     });
 }
