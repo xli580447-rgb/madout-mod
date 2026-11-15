@@ -1,16 +1,16 @@
 //
-//  bullettrack.mm — MadOut 2 (US) 21.30 全功能 dylib
+//  bullettrack.mm 鈥?MadOut 2 (US) 21.30 鍏ㄥ姛鑳?dylib
 //
-//  功能表：
-//    1. 子弹追踪      Shots::Add 改写每颗弹丸 dir → 静默命中（霰弹逐弹丸生效）
-//    2. 自定义射速    100–700 RPM，只作用于本地玩家，内部 100ms 冷却被绕过
-//    3. 扩容弹匣      Weapon.Bullets::get_Count 抬高 + MinusOne 不扣弹
-//    4. 超大命中范围  IntersectionBone::ProcessShot 期间按倍数放大骨骼命中球半径
-//    5. 坐标自瞄      Control::SetCamDirByWorldPoint（静默：开火瞬间瞄准、开完还原）
-//    6. ESP           方框 / 18 段骨骼 / 距离 / 准心连线（UIKit 浮层，30fps）
+//  鍔熻兘琛細
+//    1. 瀛愬脊杩借釜      Shots::Add 鏀瑰啓姣忛寮逛父 dir 鈫?闈欓粯鍛戒腑锛堥湴寮归€愬脊涓哥敓鏁堬級
+//    2. 鑷畾涔夊皠閫?   100鈥?00 RPM锛屽彧浣滅敤浜庢湰鍦扮帺瀹讹紝鍐呴儴 100ms 鍐峰嵈琚粫杩?
+//    3. 鎵╁寮瑰專      Weapon.Bullets::get_Count 鎶珮 + MinusOne 涓嶆墸寮?
+//    4. 瓒呭ぇ鍛戒腑鑼冨洿  IntersectionBone::ProcessShot 鏈熼棿鎸夊€嶆暟鏀惧ぇ楠ㄩ鍛戒腑鐞冨崐寰?
+//    5. 鍧愭爣鑷瀯      Control::SetCamDirByWorldPoint锛堥潤榛橈細寮€鐏灛闂寸瀯鍑嗐€佸紑瀹岃繕鍘燂級
+//    6. ESP           鏂规 / 18 娈甸楠?/ 璺濈 / 鍑嗗績杩炵嚎锛圲IKit 娴眰锛?0fps锛?
 //
-//  版本锁定：UnityFramework 21.30（metadata v39）。换版本需重跑 dump 更新 RVA。
-//  编译：Theos（见同目录 Makefile），链接 libsubstrate 提供 MSHookFunction。
+//  鐗堟湰閿佸畾锛歎nityFramework 21.30锛坢etadata v39锛夈€傛崲鐗堟湰闇€閲嶈窇 dump 鏇存柊 RVA銆?
+//  缂栬瘧锛歍heos锛堣鍚岀洰褰?Makefile锛夛紝閾炬帴 libsubstrate 鎻愪緵 MSHookFunction銆?
 //
 
 #import <UIKit/UIKit.h>
@@ -23,21 +23,88 @@
 #include <mutex>
 #include <time.h>
 
-/* 钩子引擎：
-   - 越狱 + substrate：定义 USE_SUBSTRATE
-   - 非越狱（全能签注入）：用 Dobby 自带 inline hook，静态链 libdobby.a
+/* ============================== 閽╁瓙寮曟搸 ==============================
+   闈炶秺鐙变笉鑳?mmap 鍙墽琛屽唴瀛橈紝鎵€浠?trampoline 棰勭暀鍦ㄦ湰 dylib 鐨?__TEXT 閲岋紝
+   杩愯鏃剁敤 vm_protect(VM_PROT_COPY) 鏀规垚鍙啓銆佸啓瀹屽啀鏀瑰洖鍙墽琛屻€?
+   瓒婄嫳鐜瀹氫箟 USE_SUBSTRATE 鏃惰蛋 substrate銆?
 */
 #ifdef USE_SUBSTRATE
 extern "C" void MSHookFunction(void *symbol, void *replace, void **result);
 #else
-extern "C" int DobbyHook(void *address, void *replace, void **origin);
+#include <mach/mach.h>
+#include <mach/vm_map.h>
+#include <libkern/OSCacheControl.h>
+
+__attribute__((used, aligned(16384), section("__TEXT,__tramp")))
+static unsigned char g_trampArea[32768];
+static size_t g_trampUsed = 0;
+
+static bool bt_page_writable(void *addr, size_t len) {
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)addr, len, false,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    return kr == KERN_SUCCESS;
+}
+static void bt_page_exec(void *addr, size_t len) {
+    vm_protect(mach_task_self(), (vm_address_t)addr, len, false,
+               VM_PROT_READ | VM_PROT_EXECUTE);
+}
+static bool bt_insn_is_pcrel(uint32_t insn) {
+    if ((insn & 0xFC000000u) == 0x14000000u) return true;  /* b / bl */
+    if ((insn & 0x9F000000u) == 0x90000000u) return true;  /* adrp */
+    if ((insn & 0x9F000000u) == 0x10000000u) return true;  /* adr */
+    if ((insn & 0x3B000000u) == 0x18000000u) return true;  /* ldr literal */
+    if ((insn & 0x7E000000u) == 0x34000000u) return true;  /* cbz / cbnz */
+    return false;
+}
+
+/* 杩斿洖 trampoline锛堣皟鐢ㄥ畠 = 鎵ц鍘熷嚱鏁帮級锛屽け璐ヨ繑鍥?NULL */
+static void *bt_hook(void *target, void *replacement) {
+    if (!target || !replacement) return NULL;
+    uint32_t *t = (uint32_t *)target;
+    uint32_t stolen[4];
+    for (int i = 0; i < 4; i++) {
+        stolen[i] = t[i];
+        if (bt_insn_is_pcrel(stolen[i])) {
+            NSLog(@"[BT] hook 0x%lx 澶辫触锛歱rologue 鍚?PC 鐩稿鎸囦护 0x%08x",
+                  (unsigned long)(uintptr_t)target, stolen[i]);
+            return NULL;
+        }
+    }
+    if (g_trampUsed + 64 > sizeof(g_trampArea)) return NULL;
+
+    unsigned char *tramp = g_trampArea + g_trampUsed;
+    g_trampUsed += 64;
+
+    if (!bt_page_writable(g_trampArea, sizeof(g_trampArea))) {
+        NSLog(@"[BT] trampoline 椤典笉鍙啓");
+        return NULL;
+    }
+    uint32_t *w = (uint32_t *)tramp;
+    w[0] = stolen[0]; w[1] = stolen[1]; w[2] = stolen[2]; w[3] = stolen[3];
+    w[4] = 0x58000050u;   /* ldr x16, #8 */
+    w[5] = 0xd61f0200u;   /* br  x16    */
+    *(uint64_t *)&w[6] = (uint64_t)(uintptr_t)target + 16;
+
+    if (!bt_page_writable(target, 16)) { NSLog(@"[BT] 鐩爣椤典笉鍙啓"); return NULL; }
+    uint32_t *p = (uint32_t *)target;
+    p[0] = 0x58000050u;
+    p[1] = 0xd61f0200u;
+    *(uint64_t *)&p[2] = (uint64_t)(uintptr_t)replacement;
+
+    sys_icache_invalidate(tramp, 32);
+    sys_icache_invalidate(target, 16);
+    bt_page_exec(g_trampArea, sizeof(g_trampArea));
+    bt_page_exec(target, 16);
+    return tramp;
+}
+
 static inline void MSHookFunction(void *symbol, void *replace, void **result) {
-    DobbyHook(symbol, replace, result);
+    void *tramp = bt_hook(symbol, replace);
+    if (result) *result = tramp;
 }
 #endif
 
-
-/* ============================== 数学 ============================== */
+/* ============================== 鏁板 ============================== */
 
 struct Vec3 {
     float x, y, z;
@@ -65,7 +132,7 @@ static const uint32_t RVA_Bullets_GetCount = 0x45994A0;  // Weapon.Bullets::get_
 static const uint32_t RVA_CmdShot_Reliable = 0x48E6B2C;  // NetControlPlayer::Cmd_Shot_Reliable
 static const uint32_t RVA_CmdShot_Unrel    = 0x48E6CC4;  // NetControlPlayer::Cmd_Shot_Unreliable
 
-/* ============================== 21.30 字段偏移 ============================== */
+/* ============================== 21.30 瀛楁鍋忕Щ ============================== */
 
 static const size_t OFS_WEAPON_PLAYER  = 0x0C0;  // PlayerWeaponeBase.player
 static const size_t OFS_LAST_SHOT_TIME = 0x028;  // WeaponView.last_time_shot
@@ -80,7 +147,7 @@ static const size_t OFS_ITEM_DIR       = 0x03C;  // Shots.Item.dir
 static const size_t OFS_ITEM_CAMDIR    = 0x048;  // Shots.Item.camDir
 static const size_t OFS_ITEM_SPEED     = 0x054;  // Shots.Item.speed
 
-/* ============================== il2cpp 桥 ============================== */
+/* ============================== il2cpp 妗?============================== */
 
 struct Il2CppApi {
     void *(*domain_get)();
@@ -133,19 +200,19 @@ static void *resolveMethod(void *klass, const char *name, int argc) {
     return methodPtr(il2.class_get_method_from_name(klass, name, argc));
 }
 
-/* ============================== 配置 ============================== */
+/* ============================== 閰嶇疆 ============================== */
 
 struct Config {
-    bool  bulletTrack = true;    // 子弹追踪
-    bool  patchAll    = false;   // 连 AI/载具武器一起改（默认关）
-    bool  fireRate    = false;   // 自定义射速
+    bool  bulletTrack = true;    // 瀛愬脊杩借釜
+    bool  patchAll    = false;   // 杩?AI/杞藉叿姝﹀櫒涓€璧锋敼锛堥粯璁ゅ叧锛?
+    bool  fireRate    = false;   // 鑷畾涔夊皠閫?
     float rpm         = 700.0f;  // 100..700
-    bool  extMag      = false;   // 扩容弹匣
-    int   magSize     = 300;     // 弹匣容量
-    bool  hitbox      = false;   // 超大命中范围
-    float hitboxMul   = 4.0f;    // 命中球半径倍数 1..12
-    bool  aim         = false;   // 坐标自瞄
-    int   aimMode     = 1;       // 1=静默(开火瞬间) 2=持续跟随
+    bool  extMag      = false;   // 鎵╁寮瑰專
+    int   magSize     = 300;     // 寮瑰專瀹归噺
+    bool  hitbox      = false;   // 瓒呭ぇ鍛戒腑鑼冨洿
+    float hitboxMul   = 4.0f;    // 鍛戒腑鐞冨崐寰勫€嶆暟 1..12
+    bool  aim         = false;   // 鍧愭爣鑷瀯
+    int   aimMode     = 1;       // 1=闈欓粯(寮€鐏灛闂? 2=鎸佺画璺熼殢
     float aimFov      = 60.0f;
     float aimDist     = 300.0f;
     float aimHeight   = 0.0f;
@@ -157,13 +224,13 @@ struct Config {
 };
 static Config gCfg;
 
-/* 运行统计：给菜单里的状态行用（真机没 Mac 也能看结果） */
+/* 杩愯缁熻锛氱粰鑿滃崟閲岀殑鐘舵€佽鐢紙鐪熸満娌?Mac 涔熻兘鐪嬬粨鏋滐級 */
 struct BtStats {
     volatile int doShot, add, patched, bone, minusOne, getCount, cmdShot, itemUpdate, espN;
 };
 static BtStats gStats;
 
-/* ============================== 状态 ============================== */
+/* ============================== 鐘舵€?============================== */
 
 static void *gLocalPlayer = nullptr;
 static double gLocalPlayerAt = 0;
@@ -174,7 +241,7 @@ static double gNextFireMs = 0;
 static std::vector<void *> gMyItems;
 static std::mutex gItemMutex;
 
-static Vec3 gPendingAimDir;          // 本次开火要发往服务端的方向
+static Vec3 gPendingAimDir;          // 鏈寮€鐏鍙戝線鏈嶅姟绔殑鏂瑰悜
 static bool gHasPendingAim = false;
 
 static double nowMs() {
@@ -191,7 +258,7 @@ static void *currentPlayer() {
     return gLocalPlayer;
 }
 
-/* ============================== 目标 ============================== */
+/* ============================== 鐩爣 ============================== */
 
 struct Target {
     void *ctrl = nullptr;
@@ -254,7 +321,7 @@ static bool bestTarget(Vec3 origin, Vec3 camDir, Target &out) {
     return false;
 }
 
-/* ============================== 相机 / 瞄准 ============================== */
+/* ============================== 鐩告満 / 鐬勫噯 ============================== */
 
 typedef Vec3 (*GetCurCamDir_t)(void *);
 typedef void (*SetCamDirVec_t)(void *, Vec3);
@@ -271,7 +338,7 @@ static void aimPoint(void *player, Vec3 point) {
     if (player && pSetCamDirByWorldPoint) pSetCamDirByWorldPoint(player, point);
 }
 
-/* ============================== 钩子：开火 ============================== */
+/* ============================== 閽╁瓙锛氬紑鐏?============================== */
 
 typedef void (*DoShot_t)(void *);
 static DoShot_t orig_DoShot = nullptr;
@@ -288,8 +355,8 @@ static void hook_DoShot(void *self) {
         double interval = 60000.0 / fmaxf(100.0f, fminf(700.0f, gCfg.rpm));
         if (nowMs() >= gNextFireMs) {
             gNextFireMs = nowMs() + interval;
-            // 内部冷却：nTime - last_time_shot >= NeedFireTimeMS/1000 (100ms)。
-            // 把上次开火时间推到远古 → 本帧必定通过；未到间隔就不动，交给游戏自己拦。
+            // 鍐呴儴鍐峰嵈锛歯Time - last_time_shot >= NeedFireTimeMS/1000 (100ms)銆?
+            // 鎶婁笂娆″紑鐏椂闂存帹鍒拌繙鍙?鈫?鏈抚蹇呭畾閫氳繃锛涙湭鍒伴棿闅斿氨涓嶅姩锛屼氦缁欐父鎴忚嚜宸辨嫤銆?
             *(float *)((char *)self + OFS_LAST_SHOT_TIME) = -1.0e6f;
         }
     }
@@ -308,13 +375,13 @@ static void hook_DoShot(void *self) {
     orig_DoShot(self);
 
     if (gNeedRestore && pSetCamDirByVector) {
-        pSetCamDirByVector(lp, gSavedCamDir);   // 静默：开完立刻还原视角
+        pSetCamDirByVector(lp, gSavedCamDir);   // 闈欓粯锛氬紑瀹岀珛鍒昏繕鍘熻瑙?
         gNeedRestore = false;
     }
     gInLocalShot = false;
 }
 
-/* ============================== 钩子：弹丸方向 ============================== */
+/* ============================== 閽╁瓙锛氬脊涓告柟鍚?============================== */
 
 typedef void *(*ShotsAdd_t)(void *, Vec3, Vec3, Vec3, float, float, int, int, float, bool, bool, float);
 static ShotsAdd_t orig_ShotsAdd = nullptr;
@@ -340,23 +407,23 @@ static void *hook_ShotsAdd(void *self, Vec3 pos, Vec3 dir, Vec3 camDir, float sp
     if (!item) return item;
     if (!gInLocalShot && !gCfg.patchAll) return item;
 
-    rememberItem(item);           // 命中范围/归属判定要用，和是否改方向无关
+    rememberItem(item);           // 鍛戒腑鑼冨洿/褰掑睘鍒ゅ畾瑕佺敤锛屽拰鏄惁鏀规柟鍚戞棤鍏?
     if (!gCfg.bulletTrack) return item;
 
     Target t;
     if (bestTarget(pos, camDir, t)) {
         Vec3 aim = t.pos;
-        if (speed > 1.0f) aim = vadd(aim, vmul(t.vel, t.dist / speed));  // 提前量
+        if (speed > 1.0f) aim = vadd(aim, vmul(t.vel, t.dist / speed));  // 鎻愬墠閲?
         Vec3 nd = vnorm(vsub(aim, pos));
         *(Vec3 *)((char *)item + OFS_ITEM_DIR) = nd;
-        // 同一次开火要发给服务端的 NetShotInfo 也记一份，见 hook_CmdShot
+        // 鍚屼竴娆″紑鐏鍙戠粰鏈嶅姟绔殑 NetShotInfo 涔熻涓€浠斤紝瑙?hook_CmdShot
         gPendingAimDir = nd;
         gHasPendingAim = true;
     }
     return item;
 }
 
-/* ============================== 钩子：上行 shot 数据（保证服务端复算同一个方向） ============================== */
+/* ============================== 閽╁瓙锛氫笂琛?shot 鏁版嵁锛堜繚璇佹湇鍔＄澶嶇畻鍚屼竴涓柟鍚戯級 ============================== */
 
 // NetShotInfo { Vector3 CameraDirection; Vector3 BaseDirection; Vector3 ShotPosition; ... }
 static const size_t OFS_NSI_CAMDIR = 0x00;
@@ -385,7 +452,7 @@ static void hook_CmdShotUnrel(void *self, void *info) {
     orig_CmdShotUnrel(self, info);
 }
 
-/* ============================== 钩子：弹丸归属 ============================== */
+/* ============================== 閽╁瓙锛氬脊涓稿綊灞?============================== */
 
 typedef void (*ItemUpdate_t)(void *);
 static ItemUpdate_t orig_ItemUpdate = nullptr;
@@ -397,7 +464,7 @@ static void hook_ItemUpdate(void *self) {
     gCurrentItemMine = false;
 }
 
-/* ============================== 钩子：碰撞箱（命中球半径） ============================== */
+/* ============================== 閽╁瓙锛氱鎾炵锛堝懡涓悆鍗婂緞锛?============================== */
 
 typedef bool (*BoneProcessShot_t)(void *, Ray *, void *);
 static BoneProcessShot_t orig_BoneProcessShot = nullptr;
@@ -415,7 +482,7 @@ static bool hook_BoneProcessShot(void *self, Ray *ray, void *shot) {
     return hit;
 }
 
-/* ============================== 钩子：弹药 ============================== */
+/* ============================== 閽╁瓙锛氬脊鑽?============================== */
 
 typedef void (*MinusOne_t)(void *);
 typedef int (*GetCount_t)(void *);
@@ -424,7 +491,7 @@ static GetCount_t orig_GetCount = nullptr;
 
 static void hook_MinusOne(void *self) {
     gStats.minusOne++;
-    if (gCfg.extMag) return;      // 不扣弹
+    if (gCfg.extMag) return;      // 涓嶆墸寮?
     orig_MinusOne(self);
 }
 
@@ -435,7 +502,7 @@ static int hook_GetCount(void *self) {
     return c;
 }
 
-/* ============================== 世界 → 屏幕 ============================== */
+/* ============================== 涓栫晫 鈫?灞忓箷 ============================== */
 
 typedef Vec3 (*W2S_t)(void *, Vec3);
 typedef void *(*GetMainCam_t)(void *);
@@ -450,7 +517,7 @@ static GetInt_t pScreenW = nullptr, pScreenH = nullptr;
 
 static void *mainCamera() { return pGetMainCam ? pGetMainCam(nullptr) : nullptr; }
 
-// 返回归一化坐标 [0,1]，原点左下（Unity 屏幕空间），由调用方换算成视图坐标
+// 杩斿洖褰掍竴鍖栧潗鏍?[0,1]锛屽師鐐瑰乏涓嬶紙Unity 灞忓箷绌洪棿锛夛紝鐢辫皟鐢ㄦ柟鎹㈢畻鎴愯鍥惧潗鏍?
 static bool projectNorm(Vec3 world, CGPoint &out) {
     void *cam = mainCamera();
     if (!cam || !pW2S || !pScreenW || !pScreenH) return false;
@@ -551,7 +618,7 @@ static const int kSkeletonPairs[][2] = {
 }
 @end
 
-/* ============================== 菜单 ============================== */
+/* ============================== 鑿滃崟 ============================== */
 
 @interface BTMenu : UIView
 - (void)buildUI;
@@ -612,7 +679,7 @@ static UISwitch *mkSwitch(UIView *parent, NSString *title, BOOL on, SEL action, 
     [self addSubview:scroll];
 
     _title = [[UILabel alloc] initWithFrame:CGRectMake(12, 6, W - 24, 22)];
-    _title.text = @"MadOut2 21.30  ·  YG";
+    _title.text = @"MadOut2 21.30  路  YG";
     _title.textColor = [UIColor colorWithRed:0.3 green:1 blue:0.5 alpha:1];
     _title.font = [UIFont boldSystemFontOfSize:13];
     _title.userInteractionEnabled = YES;
@@ -620,32 +687,32 @@ static UISwitch *mkSwitch(UIView *parent, NSString *title, BOOL on, SEL action, 
     [_title addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)]];
 
     CGFloat y = 4;
-    mkSwitch(scroll, @"子弹追踪", gCfg.bulletTrack, @selector(onBulletTrack:), self, y); y += 36;
-    mkSwitch(scroll, @"自定义射速", gCfg.fireRate, @selector(onFireRate:), self, y); y += 36;
-    mkSlider(scroll, @"射速 RPM (100-700)", 100, 700, gCfg.rpm, @selector(onRpm:), self, y); y += 52;
-    mkSwitch(scroll, @"扩容弹匣", gCfg.extMag, @selector(onMag:), self, y); y += 36;
-    mkSlider(scroll, @"弹匣容量", 30, 999, (float)gCfg.magSize, @selector(onMagSize:), self, y); y += 52;
-    mkSwitch(scroll, @"超大命中范围", gCfg.hitbox, @selector(onHitbox:), self, y); y += 36;
-    mkSlider(scroll, @"碰撞箱倍数", 1, 12, gCfg.hitboxMul, @selector(onHitboxMul:), self, y); y += 52;
-    mkSwitch(scroll, @"坐标自瞄", gCfg.aim, @selector(onAim:), self, y); y += 36;
-    mkSlider(scroll, @"自瞄 FOV", 10, 180, gCfg.aimFov, @selector(onAimFov:), self, y); y += 52;
-    mkSlider(scroll, @"自瞄距离", 20, 600, gCfg.aimDist, @selector(onAimDist:), self, y); y += 52;
-    mkSwitch(scroll, @"人物方框", gCfg.esp, @selector(onEsp:), self, y); y += 36;
-    mkSwitch(scroll, @"骨骼", gCfg.espSkeleton, @selector(onSkel:), self, y); y += 36;
-    mkSwitch(scroll, @"距离显示", gCfg.espDistance, @selector(onDist:), self, y); y += 36;
+    mkSwitch(scroll, @"瀛愬脊杩借釜", gCfg.bulletTrack, @selector(onBulletTrack:), self, y); y += 36;
+    mkSwitch(scroll, @"鑷畾涔夊皠閫?, gCfg.fireRate, @selector(onFireRate:), self, y); y += 36;
+    mkSlider(scroll, @"灏勯€?RPM (100-700)", 100, 700, gCfg.rpm, @selector(onRpm:), self, y); y += 52;
+    mkSwitch(scroll, @"鎵╁寮瑰專", gCfg.extMag, @selector(onMag:), self, y); y += 36;
+    mkSlider(scroll, @"寮瑰專瀹归噺", 30, 999, (float)gCfg.magSize, @selector(onMagSize:), self, y); y += 52;
+    mkSwitch(scroll, @"瓒呭ぇ鍛戒腑鑼冨洿", gCfg.hitbox, @selector(onHitbox:), self, y); y += 36;
+    mkSlider(scroll, @"纰版挒绠卞€嶆暟", 1, 12, gCfg.hitboxMul, @selector(onHitboxMul:), self, y); y += 52;
+    mkSwitch(scroll, @"鍧愭爣鑷瀯", gCfg.aim, @selector(onAim:), self, y); y += 36;
+    mkSlider(scroll, @"鑷瀯 FOV", 10, 180, gCfg.aimFov, @selector(onAimFov:), self, y); y += 52;
+    mkSlider(scroll, @"鑷瀯璺濈", 20, 600, gCfg.aimDist, @selector(onAimDist:), self, y); y += 52;
+    mkSwitch(scroll, @"浜虹墿鏂规", gCfg.esp, @selector(onEsp:), self, y); y += 36;
+    mkSwitch(scroll, @"楠ㄩ", gCfg.espSkeleton, @selector(onSkel:), self, y); y += 36;
+    mkSwitch(scroll, @"璺濈鏄剧ず", gCfg.espDistance, @selector(onDist:), self, y); y += 36;
 
     UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, y, W - 24, 74)];
     st.numberOfLines = 0;
     st.tag = 901;
     st.font = [UIFont systemFontOfSize:9];
     st.textColor = [UIColor colorWithWhite:0.72 alpha:1];
-    st.text = @"状态读取中…";
+    st.text = @"鐘舵€佽鍙栦腑鈥?;
     [scroll addSubview:st];
     y += 78;
 
     UIButton *cp = [UIButton buttonWithType:UIButtonTypeSystem];
     cp.frame = CGRectMake(12, y, W - 24, 30);
-    [cp setTitle:@"复制状态" forState:UIControlStateNormal];
+    [cp setTitle:@"澶嶅埗鐘舵€? forState:UIControlStateNormal];
     [cp addTarget:self action:@selector(copyStatus) forControlEvents:UIControlEventTouchUpInside];
     [scroll addSubview:cp];
     y += 36;
@@ -656,16 +723,16 @@ static UISwitch *mkSwitch(UIView *parent, NSString *title, BOOL on, SEL action, 
 - (void)copyStatus {
     NSString *t = [BTMenu statusText];
     [UIPasteboard generalPasteboard].string = t;
-    _title.text = @"已复制 · MadOut2 21.30";
+    _title.text = @"宸插鍒?路 MadOut2 21.30";
 }
 
 + (NSString *)statusText {
     uintptr_t base = resolveBase();
     return [NSString stringWithFormat:
-        @"base: %@\nhooks: %d/8  il2cpp: %@\nDoShot %d · Add %d · 改写 %d\n命中球 %d · 弹匣 %d/%d · 上行 %d\nESP %d 人",
-        base ? [NSString stringWithFormat:@"0x%lx", (unsigned long)base] : @"未就绪",
+        @"base: %@\nhooks: %d/8  il2cpp: %@\nDoShot %d 路 Add %d 路 鏀瑰啓 %d\n鍛戒腑鐞?%d 路 寮瑰專 %d/%d 路 涓婅 %d\nESP %d 浜?,
+        base ? [NSString stringWithFormat:@"0x%lx", (unsigned long)base] : @"鏈氨缁?,
         gHooked ? 8 : 0,
-        gReady ? @"ok" : @"未初始化",
+        gReady ? @"ok" : @"鏈垵濮嬪寲",
         gStats.doShot, gStats.add, gStats.patched,
         gStats.bone, gStats.minusOne, gStats.getCount, gStats.cmdShot,
         gStats.espN];
@@ -693,14 +760,14 @@ static UISwitch *mkSwitch(UIView *parent, NSString *title, BOOL on, SEL action, 
 
 @end
 
-/* ============================== 浮层 ============================== */
+/* ============================== 娴眰 ============================== */
 
 @interface BTWindow : UIWindow
 @end
 @implementation BTWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *v = [super hitTest:point withEvent:event];
-    if (v == self || v == self.rootViewController.view) return nil;   // 空白处放行给游戏
+    if (v == self || v == self.rootViewController.view) return nil;   // 绌虹櫧澶勬斁琛岀粰娓告垙
     return v;
 }
 @end
@@ -771,7 +838,7 @@ static UISwitch *mkSwitch(UIView *parent, NSString *title, BOOL on, SEL action, 
         UILabel *st = (UILabel *)[self.menu viewWithTag:901];
         if (st && !self.menu.hidden) st.text = [BTMenu statusText];
     }
-    if (gCfg.aim && gCfg.aimMode == 2 && gReady) {          // 持续跟随模式
+    if (gCfg.aim && gCfg.aimMode == 2 && gReady) {          // 鎸佺画璺熼殢妯″紡
         void *lp = currentPlayer();
         if (lp && pGetCurCamDir) {
             Vec3 origin = *(Vec3 *)((char *)lp + OFS_CTRL_BODY_POS);
@@ -783,12 +850,12 @@ static UISwitch *mkSwitch(UIView *parent, NSString *title, BOOL on, SEL action, 
 
 @end
 
-/* ============================== 启动 ============================== */
+/* ============================== 鍚姩 ============================== */
 
 static bool gHooked = false;
 
-/* dylib 由主程序在启动早期加载，此时 UnityFramework 往往还没进内存。
-   这里先 dlsym+dladdr，失败再主动 dlopen 一次；仍然失败就返回 0，由上层重试。 */
+/* dylib 鐢变富绋嬪簭鍦ㄥ惎鍔ㄦ棭鏈熷姞杞斤紝姝ゆ椂 UnityFramework 寰€寰€杩樻病杩涘唴瀛樸€?
+   杩欓噷鍏?dlsym+dladdr锛屽け璐ュ啀涓诲姩 dlopen 涓€娆★紱浠嶇劧澶辫触灏辫繑鍥?0锛岀敱涓婂眰閲嶈瘯銆?*/
 static uintptr_t resolveBase() {
     if (gBase) return gBase;
     void *sym = dlsym(RTLD_DEFAULT, "il2cpp_domain_get");
@@ -883,12 +950,12 @@ static bool initIl2cpp() {
 }
 
 static void bt_bootstrap() {
-    /* 先等 UnityFramework 进内存再把钩子挂上（早期加载时它还不在） */
+    /* 鍏堢瓑 UnityFramework 杩涘唴瀛樺啀鎶婇挬瀛愭寕涓婏紙鏃╂湡鍔犺浇鏃跺畠杩樹笉鍦級 */
     for (int i = 0; i < 600 && !gHooked; i++) {
         if (installHooks()) break;
         usleep(200 * 1000);
     }
-    for (int i = 0; i < 600 && !gReady; i++) {   // 最多等 60s，等 IL2CPP 域起来
+    for (int i = 0; i < 600 && !gReady; i++) {   // 鏈€澶氱瓑 60s锛岀瓑 IL2CPP 鍩熻捣鏉?
         if (initIl2cpp()) break;
         usleep(250 * 1000);
     }
@@ -900,5 +967,3 @@ __attribute__((constructor)) static void bt_entry() {
         bt_bootstrap();
     });
 }
-
-// touch 2026-11-16T01:32:17.2238810+08:00
