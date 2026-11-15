@@ -1,0 +1,51 @@
+name: build
+
+# 单文件作弊模块：一个 .mm → 一个 MadOutBT.dylib
+# 不需要 H5GG、不需要 h5frida、不需要 Frida、不需要越狱
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'MadOutBT.mm'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 构建 Dobby（inline hook 引擎）
+        run: |
+          set -e
+          git clone --depth 1 --recursive https://github.com/jmpews/Dobby.git /tmp/dobby
+          cd /tmp/dobby && mkdir -p build && cd build
+          ( cmake .. -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
+                     -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DCMAKE_BUILD_TYPE=Release \
+                     -DDOBBY_GENERATE_SHARED=OFF \
+            || cmake .. -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_ARCHITECTURES=arm64 \
+                        -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DCMAKE_BUILD_TYPE=Release )
+          make -j$(sysctl -n hw.ncpu)
+          find . -name "*.a" | tee /tmp/libs.txt
+
+      - name: 编译 MadOutBT.dylib
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          LIB=$(grep -m1 'libdobby.a' /tmp/libs.txt || head -1 /tmp/libs.txt)
+          echo "static lib: $LIB"
+          mkdir -p out
+          xcrun --sdk iphoneos clang++ -arch arm64 -miphoneos-version-min=14.0 \
+            -isysroot "$SDK" -fobjc-arc -std=c++17 -O2 -dynamiclib \
+            -framework UIKit -framework Foundation -framework QuartzCore \
+            -Wl,-install_name,@executable_path/Frameworks/MadOutBT.dylib \
+            -Wl,-undefined,dynamic_lookup \
+            MadOutBT.mm "$LIB" -o out/MadOutBT.dylib
+          file out/MadOutBT.dylib
+          ls -l out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MadOutBT
+          path: out/MadOutBT.dylib
