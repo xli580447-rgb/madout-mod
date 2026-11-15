@@ -69,6 +69,18 @@ static void *img_find(const char *n) {
 
 static void *call0(void *mi, void *self) { return (mi && f_invoke) ? f_invoke(mi, self, NULL, NULL) : NULL; }
 
+/* int 返回值：il2cpp_runtime_invoke 返回的是指向值的指针（或装箱对象） */
+static int call_int(void *mi, void *self) {
+    void *r = call0(mi, self);
+    if (!r) return 0;
+    int v = 0;
+    memcpy(&v, r, 4);
+    if (v <= 0 || v > 20000) {
+        if (f_unbox) { void *u = f_unbox(r); if (u) memcpy(&v, u, 4); }
+    }
+    return v;
+}
+
 static bool call_vec3(void *mi, void *self, Vec3 *arg, Vec3 *out) {
     if (!mi || !f_invoke) return false;
     void *params[1]; void *buf = NULL;
@@ -123,6 +135,8 @@ static bool il2_init(void) {
 
 /* ================= 配置 / 全局 ================= */
 static BOOL gBox = YES, gSkel = NO, gDist = YES;
+static int gDbgTotal = 0, gDbgDrawn = 0;
+static NSString *gDbgText = @"-";
 static float gMaxDist = 300.0f;
 static BOOL gVerified = NO;
 static int gWinCount = 0;
@@ -146,6 +160,7 @@ static const int kPairs[18][2] = {
 
 @implementation UMESPView
 - (BOOL)pointInside:(CGPoint)p withEvent:(UIEvent *)e { return NO; }
+- (void)tick:(CADisplayLink *)link { [self setNeedsDisplay]; }
 
 - (void)drawRect:(CGRect)rect {
     if (!gIl2 || (!gBox && !gSkel)) return;
@@ -162,12 +177,14 @@ static const int kPairs[18][2] = {
     int n = *(int *)((char *)list + 0x18);
     if (!items || n <= 0 || n > 4096) return;
 
-    int sw = mScrW ? (int)(intptr_t)call0(mScrW, NULL) : 0;
-    int sh = mScrH ? (int)(intptr_t)call0(mScrH, NULL) : 0;
+    int sw = call_int(mScrW, NULL);
+    int sh = call_int(mScrH, NULL);
     if (sw <= 0 || sh <= 0) return;
 
     void *cam = call0(mCamMain, NULL);
-    if (!cam) return;
+    if (!cam) { gDbgText = @"no camera"; return; }
+    gDbgTotal = n;
+    int drawn = 0;
 
     CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
     Vec3 origin; memcpy(&origin, (char *)lp + 0x194, 12);
@@ -200,6 +217,7 @@ static const int kPairs[18][2] = {
         CGFloat bh = fabs(fy - hy), bw = bh * 0.5f;
         if (bh < 6 || bh > H * 1.6f) continue;
 
+        drawn++;
         if (gBox) {
             CGContextSetLineWidth(cx, 1.6);
             CGContextSetRGBStrokeColor(cx, 1.0, 0.30, 0.30, 1.0);
@@ -234,6 +252,8 @@ static const int kPairs[18][2] = {
             }
         }
     }
+    gDbgDrawn = drawn;
+    gDbgText = [NSString stringWithFormat:@"n=%d drawn=%d sw=%d sh=%d", n, drawn, sw, sh];
 }
 @end
 
@@ -327,13 +347,18 @@ static const int kPairs[18][2] = {
         r3.on = gDist; r3.handler = ^(BOOL on) { gDist = on; [gEsp setNeedsDisplay]; };
         [self addSubview:r3];
 
-        UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(14, 168, 240, 40)];
+        UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(14, 168, 244, 44)];
         st.numberOfLines = 0;
         st.font = [UIFont systemFontOfSize:9.5];
         st.textColor = [UIColor colorWithWhite:1 alpha:0.65];
         st.text = gIl2 ? @"il2cpp 就绪" : @"il2cpp 未就绪";
         st.tag = 902;
         [self addSubview:st];
+
+        /* 每秒刷新调试信息 */
+        [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+            st.text = [NSString stringWithFormat:@"il2:%d  %@", (int)gIl2, gDbgText];
+        }];
 
         [self addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
     }
@@ -418,7 +443,7 @@ static void attach_all(void) {
             }
         });
 
-        CADisplayLink *link = [CADisplayLink displayLinkWithTarget:gEsp selector:@selector(setNeedsDisplay)];
+        CADisplayLink *link = [CADisplayLink displayLinkWithTarget:gEsp selector:@selector(tick:)];
         link.preferredFramesPerSecond = 15;
         [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     });
