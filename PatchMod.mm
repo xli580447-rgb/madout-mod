@@ -300,6 +300,8 @@ static UIView *pm_host_view(void) {
 
 static UIView *gHostView = nil;
 static UILabel *gBadge = nil;
+static UILabel *gDiag = nil;
+static BOOL gVerified = NO;
 static PMPanel *gPanel = nil;
 
 static void pm_attach_badge(void) {
@@ -307,13 +309,41 @@ static void pm_attach_badge(void) {
         if (gBadge) return;
         UIView *host = gHostView;
         if (!host) return;
-        gBadge = [[UILabel alloc] initWithFrame:CGRectMake(12, 60, 240, 18)];
-        gBadge.text = [NSString stringWithFormat:@"PM ok W:%d %@", gWinCount, gHostDesc];
-        gBadge.textColor = [UIColor colorWithRed:0.4 green:1 blue:0.6 alpha:1];
-        gBadge.font = [UIFont boldSystemFontOfSize:12];
+
+        gBadge = [[UILabel alloc] initWithFrame:CGRectMake(14, 56, 260, 26)];
+        gBadge.text = @"ULTRA MOD · 自检中";
+        gBadge.textColor = [UIColor colorWithRed:1.0 green:0.28 blue:0.28 alpha:1];  /* 红 */
+        gBadge.font = [UIFont boldSystemFontOfSize:18];
         gBadge.userInteractionEnabled = NO;
+        gBadge.layer.shadowColor = [UIColor blackColor].CGColor;
+        gBadge.layer.shadowOpacity = 0.85;
+        gBadge.layer.shadowRadius = 3;
+        gBadge.layer.shadowOffset = CGSizeMake(0, 1);
         [host addSubview:gBadge];
+
+        gDiag = [[UILabel alloc] initWithFrame:CGRectMake(14, 82, 300, 14)];
+        gDiag.text = [NSString stringWithFormat:@"W:%d  %@", gWinCount, gHostDesc];
+        gDiag.textColor = [UIColor colorWithWhite:0.85 alpha:0.9];
+        gDiag.font = [UIFont systemFontOfSize:9];
+        gDiag.userInteractionEnabled = NO;
+        [host addSubview:gDiag];
+
         NSLog(@"[PM] badge 挂到 %@", host);
+    });
+}
+
+/* 自检：面板真的挂上去并且可见 → 红字转绿字 */
+static void pm_verify(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gVerified) return;
+        BOOL ok = (gPanel != nil && gPanel.superview != nil && gPanel.window != nil &&
+                   !gPanel.hidden && gPanel.bounds.size.width > 0);
+        if (!ok) return;
+        gVerified = YES;
+        gBadge.text = @"ULTRA MOD";
+        gBadge.textColor = [UIColor colorWithRed:0.30 green:1.0 blue:0.55 alpha:1];  /* 绿 */
+        gDiag.hidden = YES;
+        NSLog(@"[PM] 自检通过，面板可见");
     });
 }
 
@@ -328,6 +358,12 @@ static void pm_attach_panel(void) {
         [gPanel addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:gPanel action:@selector(pan:)]];
         [host addSubview:gPanel];
         NSLog(@"[PM] 面板挂到 %@", host);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ pm_verify(); });
+        for (int k = 0; k < 5; k++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((k + 2) * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ pm_verify(); });
+        }
     });
 }
 
