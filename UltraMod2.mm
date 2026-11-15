@@ -131,7 +131,7 @@ static NSString *gHostDesc = @"?";
 static UIView *gHost = nil;
 static UIView *gPanel = nil;
 static UILabel *gBadge = nil, *gDiag = nil;
-static UMESPView *gEsp = nil;
+static UIView *gEsp = nil;
 
 static const int kPairs[18][2] = {
     {10,9},{9,8},{8,7},{7,0},
