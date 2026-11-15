@@ -242,27 +242,77 @@ static void refresh_status(void) {
 @end
 
 static UIWindow *gWindow = nil;
+static UILabel *gBadge = nil;
+
+/* iOS 13+ 必须挂到 UIWindowScene 上，否则窗口不会显示 */
+static UIWindowScene *pm_active_scene(void) {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)sc;
+            if (ws.activationState == UISceneActivationStateForegroundActive) return ws;
+        }
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if ([sc isKindOfClass:[UIWindowScene class]]) return (UIWindowScene *)sc;
+        }
+    }
+    return nil;
+}
+
+static UIWindow *pm_make_window(void) {
+    UIWindow *w = nil;
+    UIWindowScene *ws = pm_active_scene();
+    if (ws) {
+        w = [[UIWindow alloc] initWithWindowScene:ws];
+        w.frame = ws.coordinateSpace.bounds;
+    } else {
+        w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    }
+    w.windowLevel = UIWindowLevelAlert + 500;
+    w.backgroundColor = [UIColor clearColor];
+    UIViewController *vc = [UIViewController new];
+    vc.view.backgroundColor = [UIColor clearColor];
+    w.rootViewController = vc;
+    return w;
+}
+
+static void pm_show_badge(void) {
+    if (gBadge) return;
+    UIWindow *w = gWindow;
+    if (!w) return;
+    gBadge = [[UILabel alloc] initWithFrame:CGRectMake(12, 60, 220, 18)];
+    gBadge.text = @"PatchMod loaded";
+    gBadge.textColor = [UIColor colorWithRed:0.4 green:1 blue:0.6 alpha:1];
+    gBadge.font = [UIFont boldSystemFontOfSize:12];
+    [w.rootViewController.view addSubview:gBadge];
+}
 
 static void pm_show_menu(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (gWindow) return;
-        CGRect b = [UIScreen mainScreen].bounds;
-        gWindow = [[UIWindow alloc] initWithFrame:b];
-        gWindow.windowLevel = UIWindowLevelAlert + 500;
-        gWindow.backgroundColor = [UIColor clearColor];
-        gWindow.rootViewController = [UIViewController new];
+        if (!gWindow) {
+            gWindow = pm_make_window();
+            [gWindow setHidden:NO];
+        }
+        if (!gWindow.hidden && gWindow.rootViewController.view.subviews.count > 0) return;
 
+        CGRect b = gWindow.bounds;
         PMPanel *panel = [[PMPanel alloc] initWithFrame:CGRectMake(20, 120, 268, 240)];
         [panel addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:panel action:@selector(pan:)]];
         [gWindow.rootViewController.view addSubview:panel];
-        [gWindow makeKeyAndVisible];
+        [gWindow setHidden:NO];
+        NSLog(@"[PM] 面板已挂到窗口 %@", gWindow);
     });
 }
 
 __attribute__((constructor)) static void pm_entry(void) {
     /* 前 20 秒完全不动作，避免拖慢 Unity 启动被看门狗杀 */
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        sleep(20);
+        sleep(3);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!gWindow) { gWindow = pm_make_window(); [gWindow setHidden:NO]; }
+            pm_show_badge();
+        });
+        sleep(17);
         for (int i = 0; i < 30 && !gBase; i++) { resolve_base(); if (!gBase) sleep(1); }
         bool a = slot_init(&gMag, "MinusOne", RVA_MINUS_ONE, EXP_MINUS_ONE, INSN_RET, 0, 1);
         bool b = slot_init(&gCap, "GetCount", RVA_GET_COUNT, EXP_GET_COUNT, INSN_MOV_W0_999, INSN_RET, 2);
