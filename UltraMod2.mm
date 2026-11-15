@@ -36,6 +36,8 @@ static void *(*f_invoke)(void *, void *, void **, void **);
 
 static void *kPlayer, *kCamera, *kTransform, *kAnimator, *kScreen;
 static void *mCurPlayer, *mCamMain, *mW2S, *mGetPos, *mBone, *mScrW, *mScrH;
+static void *mAllCams, *mCamCurrent;
+static int (*f_arrlen)(void *);
 static void *fControls;
 static bool gIl2 = false;
 
@@ -52,6 +54,7 @@ static void bind_api(void) {
     f_assign   = (bool (*)(void *, void *))dlsym(RTLD_DEFAULT, "il2cpp_class_is_assignable_from");
     f_unbox    = (void *(*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_object_unbox");
     f_invoke   = (void *(*)(void *, void *, void **, void **))dlsym(RTLD_DEFAULT, "il2cpp_runtime_invoke");
+    f_arrlen   = (int (*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_array_length");
 }
 
 static void *img_find(const char *n) {
@@ -98,6 +101,30 @@ static bool call_vec3(void *mi, void *self, Vec3 *arg, Vec3 *out) {
     return true;
 }
 
+static NSString *gCamSrc = @"-";
+
+/* Camera.main 在没打 MainCamera tag 的游戏里是 null，退回 allCameras / current */
+static void *resolve_camera(void) {
+    void *c = call0(mCamMain, NULL);
+    if (c) { gCamSrc = @"main"; return c; }
+    if (mAllCams && f_arrlen) {
+        void *arr = call0(mAllCams, NULL);
+        if (arr) {
+            int n = f_arrlen(arr);
+            if (n <= 0) { int n2 = *(int *)((char *)arr + 0x18); if (n2 > 0 && n2 < 64) n = n2; }
+            for (int i = 0; i < n && i < 64; i++) {
+                void *cc = *(void **)((char *)arr + 0x20 + i * 8);
+                if (cc) { gCamSrc = [NSString stringWithFormat:@"all[%d/%d]", i, n]; return cc; }
+            }
+            gCamSrc = [NSString stringWithFormat:@"all0/%d", n];
+        }
+    }
+    void *cur = call0(mCamCurrent, NULL);
+    if (cur) { gCamSrc = @"current"; return cur; }
+    gCamSrc = @"none";
+    return NULL;
+}
+
 static void *bone_of(void *anim, int bone) {
     if (!mBone || !anim) return NULL;
     int b = bone; void *params[1] = { &b };
@@ -125,7 +152,12 @@ static bool il2_init(void) {
         fControls = kCtl ? f_fieldfrom(kCtl, "controls") : NULL;
     }
     mCurPlayer = f_methfrom(kPlayer, "get_CurrentPlayer", 0);
-    if (kCamera) { mCamMain = f_methfrom(kCamera, "get_main", 0); mW2S = f_methfrom(kCamera, "WorldToScreenPoint", 1); }
+    if (kCamera) {
+        mCamMain = f_methfrom(kCamera, "get_main", 0);
+        mAllCams = f_methfrom(kCamera, "get_allCameras", 0);
+        mCamCurrent = f_methfrom(kCamera, "get_current", 0);
+        mW2S = f_methfrom(kCamera, "WorldToScreenPoint", 1);
+    }
     if (kTransform) mGetPos = f_methfrom(kTransform, "get_position", 0);
     if (kAnimator)  mBone   = f_methfrom(kAnimator, "GetBoneTransform", 1);
     if (kScreen) { mScrW = f_methfrom(kScreen, "get_width", 0); mScrH = f_methfrom(kScreen, "get_height", 0); }
@@ -181,7 +213,7 @@ static const int kPairs[18][2] = {
     int sh = call_int(mScrH, NULL);
     if (sw <= 0 || sh <= 0) return;
 
-    void *cam = call0(mCamMain, NULL);
+    void *cam = resolve_camera();
     if (!cam) { gDbgText = @"no camera"; return; }
     gDbgTotal = n;
     int drawn = 0;
@@ -253,7 +285,7 @@ static const int kPairs[18][2] = {
         }
     }
     gDbgDrawn = drawn;
-    gDbgText = [NSString stringWithFormat:@"n=%d drawn=%d sw=%d sh=%d", n, drawn, sw, sh];
+    gDbgText = [NSString stringWithFormat:@"n=%d drawn=%d sw=%d sh=%d cam=%@", n, drawn, sw, sh, gCamSrc];
 }
 @end
 
