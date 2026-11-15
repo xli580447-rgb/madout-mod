@@ -834,6 +834,10 @@ static UISwitch *mkSwitch(UIView *parent, NSString *title, BOOL on, SEL action, 
 - (void)tick {
     [self.esp setNeedsDisplay];
 
+    /* il2cpp 类解析必须主线程，跨线程会崩 */
+    static int initTick = 0;
+    if (!gReady && (++initTick % 30) == 0) initIl2cpp();
+
     static NSTimeInterval lastUi = 0;
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     if (now - lastUi > 0.5) {
@@ -955,10 +959,6 @@ static void bt_bootstrap() {
     for (int i = 0; i < 600 && !gHooked; i++) {
         if (installHooks()) break;
         usleep(200 * 1000);
-    }
-    for (int i = 0; i < 600 && !gReady; i++) {   // 最多等 60s，等 IL2CPP 域起来
-        if (initIl2cpp()) break;
-        usleep(250 * 1000);
     }
     [[BTOverlay shared] start];
 }
