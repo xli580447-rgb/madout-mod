@@ -231,6 +231,7 @@ struct BtStats {
 static BtStats gStats;
 
 static bool gHooked = false;
+static CFAbsoluteTime gStartTime = 0;
 static bool initIl2cpp();
 static uintptr_t resolveBase();   // 前置声明（statusText 里要用）
 
@@ -822,7 +823,7 @@ static UISwitch *mkSwitch(UIView *parent, NSString *title, BOOL on, SEL action, 
         [w makeKeyAndVisible];
 
         self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
-        self.link.preferredFramesPerSecond = 30;
+        self.link.preferredFramesPerSecond = 15;
         [self.link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     });
 }
@@ -836,8 +837,16 @@ static UISwitch *mkSwitch(UIView *parent, NSString *title, BOOL on, SEL action, 
     [self.esp setNeedsDisplay];
 
     /* il2cpp 类解析必须主线程，跨线程会崩 */
-    static int initTick = 0;
-    if (!gReady && (++initTick % 30) == 0) initIl2cpp();
+    if (gStartTime == 0) gStartTime = CFAbsoluteTimeGetCurrent();
+    if (CFAbsoluteTimeGetCurrent() - gStartTime < 15.0) return;   /* 启动前 15 秒完全静默 */
+
+    static CFAbsoluteTime lastInit = 0;
+    CFAbsoluteTime nowT = CFAbsoluteTimeGetCurrent();
+    if (!gReady && nowT - lastInit > 2.0 &&
+        [UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
+        lastInit = nowT;
+        initIl2cpp();
+    }
 
     static NSTimeInterval lastUi = 0;
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
@@ -957,14 +966,15 @@ static bool initIl2cpp() {
 
 static void bt_bootstrap() {
     /* 先等 UnityFramework 进内存再把钩子挂上（早期加载时它还不在） */
-    for (int i = 0; i < 600 && !gHooked; i++) {
+    for (int i = 0; i < 60 && !gHooked; i++) {
         if (installHooks()) break;
-        usleep(200 * 1000);
+        usleep(1000 * 1000);
     }
     [[BTOverlay shared] start];
 }
 
 __attribute__((constructor)) static void bt_entry() {
+    gStartTime = CFAbsoluteTimeGetCurrent();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         bt_bootstrap();
     });
