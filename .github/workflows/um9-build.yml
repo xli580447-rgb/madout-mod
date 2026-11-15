@@ -1,0 +1,23 @@
+name: um9-build
+on: { workflow_dispatch: {} }
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld git >/dev/null
+      - run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
+          cd /tmp/sdks && git sparse-checkout set iPhoneOS16.5.sdk
+      - run: |
+          mkdir -p out
+          clang++ -target arm64-apple-ios14.0 -isysroot /tmp/sdks/iPhoneOS16.5.sdk \
+            -fobjc-arc -std=c++17 -O2 -dynamiclib -fuse-ld=lld \
+            -framework UIKit -framework Foundation -framework QuartzCore \
+            -Wl,-undefined,dynamic_lookup \
+            UltraMod9.mm -o out/UltraMod9.dylib
+          file out/UltraMod9.dylib
+      - uses: actions/upload-artifact@v4
+        with: { name: UltraMod9, path: out/UltraMod9.dylib }
